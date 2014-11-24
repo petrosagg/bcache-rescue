@@ -5,112 +5,117 @@ import (
 	"encoding/binary"
 	"fmt"
 	"github.com/petrosagg/bcache-rescue/bcache"
-	"github.com/petrosagg/bcache-rescue/crc64"
-	"github.com/satori/go.uuid"
-	"log"
+	"io"
 	"os"
 )
 
+const CHUNK_SIZE = 2048 // 10MB
+const FILE = "/dev/sdb2"
+
+func KEY_FIELD(name string, i uint64, offset, size int) {
+	d := (i >> uint(offset)) & ^(^uint64(0) << uint(size))
+	fmt.Println(name, d)
+}
+
+func scan(src io.ReadSeeker, pattern []byte, limit int) {
+	l := len(pattern)
+
+	buf := make([]byte, CHUNK_SIZE)
+
+	offset := -int64(CHUNK_SIZE - l)
+
+	for limit != 0 {
+		offset += int64(CHUNK_SIZE - l)
+		src.Seek(offset, 0)
+		// fmt.Printf("Offset: %dMB\n", offset/1024/1024)
+		_, err := io.ReadFull(src, buf)
+		if err != nil {
+			fmt.Println("ERROR:", err)
+			return
+		}
+
+		if idx := bytes.Index(buf, pattern); idx != -1 {
+			src.Seek(int64(idx-8)+offset, 0)
+
+			bset := bcache.JSet{}
+			err := bset.Load(src)
+
+			if err != nil {
+				fmt.Println("ERROR:", err)
+			}
+
+			if bset.Keys != 15 {
+				continue
+			}
+
+			fmt.Println()
+			fmt.Printf("%d %d %d\n", bset.Seq, bset.LastSeq, bset.Keys)
+
+			fmt.Printf("%x\n", bset.Start[0].High)
+			KEY_FIELD("KEY_PTRS", bset.Start[0].High, 60, 3)
+			KEY_FIELD("HEADER_SIZE", bset.Start[0].High, 58, 2)
+			KEY_FIELD("KEY_CSUM", bset.Start[0].High, 56, 2)
+			KEY_FIELD("KEY_PINNED", bset.Start[0].High, 55, 1)
+			KEY_FIELD("KEY_DIRTY", bset.Start[0].High, 36, 1)
+
+			KEY_FIELD("KEY_SIZE", bset.Start[0].High, 20, 16)
+			KEY_FIELD("KEY_INODE", bset.Start[0].High, 0, 20)
+
+			fmt.Println("Ptrs:", bset.Start[0].Ptrs())
+			fmt.Println("HeaderSize:", bset.Start[0].HeaderSize())
+			fmt.Println("Csum:", bset.Start[0].Csum())
+			fmt.Println("Pinned:", bset.Start[0].Pinned())
+			fmt.Println("Dirty:", bset.Start[0].Dirty())
+
+			fmt.Println("Size:", bset.Start[0].Size())
+			fmt.Println("Inode:", bset.Start[0].Inode())
+
+			// fmt.Println("Magic:", bset.Magic)
+			// fmt.Println("Seq:", bset.Seq)
+			// fmt.Println("Version:", bset.Version)
+			// fmt.Println("Keys:", bset.Keys)
+			// fmt.Println("LastSeq:", bset.LastSeq)
+			// fmt.Println("UUIDBucket:", bset.UUIDBucket)
+			// fmt.Println("BTreeRoot:", bset.BTreeRoot)
+			// fmt.Println("BtreeLevel:", bset.BtreeLevel)
+			// fmt.Println("PrioBucket:", bset.PrioBucket)
+			// fmt.Println("Data Length:", len(bset.Data))
+			// // fmt.Println("Data:", bset.Data)
+			// fmt.Println()
+
+			// test := make([]bcache.BKey, 0)
+			// bset.Start = test
+
+			//if
+			// bcache.MatchCsum(bset.Csum, bset) // == bset.Csum {
+			//fmt.Println("Great success")
+			//}
+
+			limit--
+		}
+
+	}
+}
+
 func main() {
-	file, err := os.Open("/dev/sdb2") // For read access.
+	sb := bcache.CacheSuperblock{}
+	bcache.ReadSuperblock(&sb, FILE)
+
+	fmt.Printf("Calculating BSET magic %x XOR %x\n", bcache.JSET_MAGIC, sb.SetMagic)
+
+	bset_magic := bcache.JSET_MAGIC ^ sb.SetMagic
+
+	fmt.Printf("JSET Magic: %d\n", bset_magic)
+
+	pattern := new(bytes.Buffer)
+	binary.Write(pattern, binary.LittleEndian, &bset_magic)
+
+	fmt.Println("Pattern size", len(pattern.Bytes()))
+
+	file, err := os.Open(FILE) // For read access.
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println(err)
 	}
 
-	sb := bcache.CacheSuperBlock{}
-
-	file.Seek(bcache.SB_START, 0)
-	err = binary.Read(file, binary.LittleEndian, &sb)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Printf("sb.magic\t\t")
-	if sb.Magic == bcache.Magic {
-		fmt.Printf("ok\n")
-	} else {
-		fmt.Printf("bad magic\n")
-		fmt.Println("Invalid superblock: bad magic")
-	}
-
-	fmt.Printf("sb.first_sector\t\t%d", sb.Offset)
-	if sb.Offset == bcache.SB_SECTOR {
-		fmt.Printf(" [match]\n")
-	} else {
-		fmt.Printf(" [expected %ds]\n", bcache.SB_SECTOR)
-		fmt.Println("Invalid superblock: bad magic")
-	}
-
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.LittleEndian, sb)
-	expected_sum := crc64.Checksum(buf.Bytes()[8:], crc64.ECMA)
-	fmt.Printf("sb.csum\t\t\t%x", sb.Csum)
-	if sb.Csum == expected_sum {
-		fmt.Printf(" [match]\n")
-	} else {
-		fmt.Printf(" [expected %x]\n", expected_sum)
-	}
-
-	fmt.Printf("sb.version\t\t%x", sb.Version)
-	switch sb.Version {
-	// These are handled the same by the kernel
-	case bcache.BCACHE_SB_VERSION_CDEV:
-	case bcache.BCACHE_SB_VERSION_CDEV_WITH_UUID:
-		fmt.Printf(" [cache device]\n")
-
-	// The second adds data offset support
-	case bcache.BCACHE_SB_VERSION_BDEV:
-	case bcache.BCACHE_SB_VERSION_BDEV_WITH_OFFSET:
-		fmt.Printf(" [backing device]\n")
-
-	default:
-		fmt.Printf(" [unknown]\n")
-	}
-
-	fmt.Printf("\n")
-
-	fmt.Printf("dev.label\t\t")
-	label := string(sb.Label[:])
-	if label[0] != 0x00 {
-		fmt.Printf(label)
-	} else {
-		fmt.Printf("(empty)")
-	}
-
-	fmt.Printf("\n")
-
-	u, _ := uuid.FromBytes(sb.UUID[:])
-	fmt.Printf("dev.uuid\t\t%s\n", u.String())
-
-	fmt.Printf("dev.sectors_per_block\t%d\ndev.sectors_per_bucket\t%d\n", sb.BlockSize, sb.BucketSize)
-
-	if !sb.IsBackingDevice() {
-		// total_sectors includes the superblock;
-		fmt.Printf("dev.cache.first_sector\t%d\n", sb.BucketSize*sb.FirstBucket)
-		fmt.Printf("dev.cache.cache_sectors\t%d\n", uint64(sb.BucketSize)*(sb.Nbuckets-uint64(sb.FirstBucket)))
-		fmt.Printf("dev.cache.total_sectors\t%d\n", uint64(sb.BucketSize)*sb.Nbuckets)
-		// fmt.Printf("dev.cache.ordered\t%s\n", CACHE_SYNC(&sb) ? "yes" : "no")
-		// fmt.Printf("dev.cache.discard\t%s\n", CACHE_DISCARD(&sb) ? "yes" : "no")
-		fmt.Printf("dev.cache.pos\t\t%d\n", sb.Nr_this_dev)
-		// fmt.Printf("dev.cache.replacement\t%d", CACHE_REPLACEMENT(&sb))
-
-		// switch CACHE_REPLACEMENT(&sb) {
-		// 	case CACHE_REPLACEMENT_LRU:
-		// 		printf(" [lru]\n");
-		// 		break;
-		// 	case CACHE_REPLACEMENT_FIFO:
-		// 		printf(" [fifo]\n");
-		// 		break;
-		// 	case CACHE_REPLACEMENT_RANDOM:
-		// 		printf(" [random]\n");
-		// 		break;
-		// 	default:
-		// 		putchar('\n');
-		// }
-	}
-
-	fmt.Printf("\n")
-
-	u, _ = uuid.FromBytes(sb.SetUUID[:])
-	fmt.Printf("cset.uuid\t\t%s\n", u.String())
+	scan(file, pattern.Bytes(), 3)
 }
